@@ -8,6 +8,10 @@ import os
 import uuid
 import json
 import re
+from dotenv import load_dotenv
+
+
+load_dotenv()
 
 app = FastAPI()
 
@@ -18,8 +22,8 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-FFMPEG  = "/usr/local/bin/ffmpeg"
-FFPROBE = "/opt/homebrew/bin/ffprobe"
+FFMPEG  = os.getenv("FFMPEG_PATH", "ffmpeg")
+FFPROBE = os.getenv("FFPROBE_PATH", "ffprobe")
 
 FONTS_DIR = os.path.join(os.path.dirname(__file__), "fonts")
 os.makedirs(FONTS_DIR, exist_ok=True)
@@ -27,17 +31,15 @@ os.makedirs(FONTS_DIR, exist_ok=True)
 FONT_NAME_MAP = {
     "Bangers":    "Bangers",
     "Bebas Neue": "Bebas Neue",
-    "BebasNeue":  "Bebas Neue",
     "Montserrat": "Montserrat",
     "Poppins":    "Poppins",
 }
 
 FONT_FILE_MAP = {
     "Bangers":    "Bangers-Regular",
-    "Bebas Neue": "BebasNeue",
-    "BebasNeue":  "BebasNeue",
-    "Montserrat": "Montserrat",
-    "Poppins":    "Poppins",
+    "Bebas Neue": "BebasNeue-Regular",
+    "Montserrat": "Montserrat-VariableFont_wght",
+    "Poppins":    "Poppins-Bold",
 }
 
 def resolve_font_name(font: str) -> str:
@@ -140,7 +142,8 @@ def build_ass_karaoke(subtitles, font, font_size, alignment,
 def build_ass_fade(subtitles, font, font_size, alignment,
                    text_color, highlight_color,
                    play_res_x=1920, play_res_y=1080, margin_v=None) -> str:
-    primary = hex_to_ass_color(text_color)
+    # Use highlight_color as primary — that's what the user picked
+    primary = hex_to_ass_color(highlight_color)
     header  = ass_header(font, font_size, alignment, primary, primary,
                          play_res_x, play_res_y, margin_v)
     lines = []
@@ -148,16 +151,17 @@ def build_ass_fade(subtitles, font, font_size, alignment,
         start = seconds_to_ass(chunk["start"])
         end   = seconds_to_ass(chunk["end"])
         text  = chunk["text"].upper()
-        lines.append(f"Dialogue: 0,{start},{end},Default,,0,0,0,,{{\\fad(200,200)}}{text}")
+        lines.append(f"Dialogue: 0,{start},{end},Default,,0,0,0,,{{\\fad(400,0)}}{text}")
     return header + "\n".join(lines)
 
 
 def build_ass_typewriter(subtitles, font, font_size, alignment,
                           text_color, highlight_color,
                           play_res_x=1920, play_res_y=1080, margin_v=None) -> str:
-    primary = hex_to_ass_color(text_color)
-    header  = ass_header(font, font_size, alignment, primary, primary,
-                         play_res_x, play_res_y, margin_v)
+    primary      = hex_to_ass_color(text_color)
+    hi           = hex_to_ass_color(highlight_color)
+    header       = ass_header(font, font_size, alignment, primary, primary,
+                              play_res_x, play_res_y, margin_v)
     lines = []
     for chunk in subtitles:
         chunk_end = seconds_to_ass(chunk["end"])
@@ -166,13 +170,32 @@ def build_ass_typewriter(subtitles, font, font_size, alignment,
             start = seconds_to_ass(chunk["start"])
             lines.append(f"Dialogue: 0,{start},{chunk_end},Default,,0,0,0,,{chunk['text'].upper()}")
             continue
+
         revealed = []
-        for word in words:
+        for i, word in enumerate(words):
             revealed.append(clean_word(word["text"]))
             word_start = seconds_to_ass(word["start"])
-            lines.append(f"Dialogue: 0,{word_start},{chunk_end},Default,,0,0,0,," + " ".join(revealed))
-    return header + "\n".join(lines)
+            # ── Fix: end this line when the NEXT word starts, not at chunk_end ──
+            # This prevents all previous lines staying active simultaneously
+            word_end = seconds_to_ass(words[i + 1]["start"]) if i + 1 < len(words) else chunk_end
 
+            # Previous words in white, newest word in highlight color
+            # Previous words in white, newest word in highlight color
+            if len(revealed) > 1:
+                prev = " ".join(revealed[:-1])
+                new  = revealed[-1]
+                # previous words: fully visible, no animation
+                # new word: starts transparent, fades to opaque over 120ms
+                text_line = (
+                    f"{{\\c{primary}}}{prev} "
+                    f"{{\\c{hi}\\alpha&HFF&\\t(0,120,\\alpha&H00&)}}{new}"
+                )
+            else:
+                text_line = f"{{\\c{hi}\\alpha&HFF&\\t(0,120,\\alpha&H00&)}}{revealed[0]}"
+
+            lines.append(f"Dialogue: 0,{word_start},{word_end},Default,,0,0,0,,{text_line}")
+
+    return header + "\n".join(lines)
 @app.post("/assemble")
 async def assemble_video(request: Request):
     form    = await request.form()
@@ -219,6 +242,8 @@ async def assemble_video(request: Request):
         print(f"[ASSEMBLE] saved image_{idx}: {os.path.getsize(img_path)} bytes -> {img_path}")
 
     async def generate():
+        import asyncio
+        loop  = asyncio.get_event_loop()
         TRANS    = 2.0
         FPS      = 25
         ZOOM_END = 1.12
@@ -238,16 +263,12 @@ async def assemble_video(request: Request):
 
         for i, scene in enumerate(scenes):
             if len(scenes) == 1:
-                # single scene — just use its own duration
                 dur = max(TRANS + 0.5, scene["end"] - scene["start"])
             elif i == 0:
-                # first scene: run until next scene's audio start (no +TRANS here)
                 dur = max(TRANS + 0.5, scenes[i + 1]["start"] - scene["start"])
             elif i < len(scenes) - 1:
-                # middle scenes: add TRANS to compensate for xfade consumption
                 dur = max(TRANS + 0.5, scenes[i + 1]["start"] - scene["start"] + TRANS)
             else:
-                # last scene: its own duration
                 dur = max(TRANS + 0.5, scene["end"] - scene["start"])
 
             durations.append(dur)
@@ -260,7 +281,6 @@ async def assemble_video(request: Request):
             if img_p:
                 frames    = max(int(dur * FPS), 1)
                 increment = (ZOOM_END - 1.0) / frames
-
                 vf = (
                     f"scale=7680:4320,"
                     f"zoompan="
@@ -286,13 +306,16 @@ async def assemble_video(request: Request):
                     "-pix_fmt", "yuv420p", "-an", "-y", seg_path
                 ]
 
-            result = subprocess.run(seg_cmd, capture_output=True)
+            # ↓ run_in_executor keeps the event loop free so SSE chunks actually stream
+            result = await loop.run_in_executor(
+                None, lambda cmd=seg_cmd: subprocess.run(cmd, capture_output=True)
+            )
             if result.returncode != 0:
                 print(f"[GEN] ERROR on segment {i}: {result.stderr.decode()}")
             else:
                 print(f"[GEN] segment {i} OK: {os.path.getsize(seg_path)} bytes")
 
-            yield f"data: {json.dumps({'progress': int((i / total) * 55)})}\n\n"
+            yield f"data: {json.dumps({'progress': int((i + 1) / total * 55)})}\n\n"
 
         # ── Cross-dissolve concat ─────────────────────────────────────────────
         raw_video = os.path.join(tmp_dir, f"raw_video_{job_id}.mp4")
@@ -301,7 +324,6 @@ async def assemble_video(request: Request):
             os.rename(segment_paths[0], raw_video)
             print(f"[GEN] single segment, skipping concat")
         else:
-            # Use TRANS directly — safe_trans caused drift when it != TRANS
             ffmpeg_inputs = []
             for sp in segment_paths:
                 ffmpeg_inputs += ["-i", sp]
@@ -325,20 +347,24 @@ async def assemble_video(request: Request):
                 prev_label  = new_label
                 cumulative += durations[i] - TRANS
 
-            # ← THIS BLOCK WAS MISSING — actually runs the xfade
-            result = subprocess.run([
+            xfade_cmd = [
                 FFMPEG, *ffmpeg_inputs,
                 "-filter_complex", ";".join(filter_parts),
                 "-map", f"[{prev_label}]",
                 "-c:v", "libx264", "-preset", "ultrafast",
                 "-pix_fmt", "yuv420p", "-y", raw_video
-            ], capture_output=True)
-
+            ]
+            result = await loop.run_in_executor(
+                None, lambda cmd=xfade_cmd: subprocess.run(cmd, capture_output=True)
+            )
             if result.returncode != 0:
                 print(f"[GEN] xfade ERROR: {result.stderr.decode()}")
             else:
                 print(f"[GEN] xfade concat OK: {os.path.getsize(raw_video)} bytes")
-        # ── Extend video to match audio (hold last frame) ─────────────────────
+
+        yield f"data: {json.dumps({'progress': 65})}\n\n"
+
+        # ── Extend video to match audio ───────────────────────────────────────
         audio_dur = get_duration(audio_path)
         video_dur = get_duration(raw_video)
         print(f"[GEN] audio={audio_dur:.2f}s  video={video_dur:.2f}s")
@@ -346,19 +372,22 @@ async def assemble_video(request: Request):
         if audio_dur > video_dur + 0.1:
             pad      = audio_dur - video_dur + 0.2
             extended = os.path.join(tmp_dir, f"extended_{job_id}.mp4")
-            result   = subprocess.run([
+            extend_cmd = [
                 FFMPEG, "-i", raw_video,
                 "-vf", f"tpad=stop_mode=clone:stop_duration={pad:.3f}",
                 "-c:v", "libx264", "-preset", "ultrafast",
                 "-pix_fmt", "yuv420p", "-y", extended
-            ], capture_output=True)
+            ]
+            result = await loop.run_in_executor(
+                None, lambda cmd=extend_cmd: subprocess.run(cmd, capture_output=True)
+            )
             if result.returncode == 0:
                 raw_video = extended
                 print(f"[GEN] extended video to {audio_dur + 0.2:.2f}s ✓")
             else:
                 print(f"[GEN] extend ERROR: {result.stderr.decode()}")
 
-        yield f"data: {json.dumps({'progress': 70})}\n\n"
+        yield f"data: {json.dumps({'progress': 75})}\n\n"
 
         # ── Mux video + audio ─────────────────────────────────────────────────
         if music_path:
@@ -376,16 +405,18 @@ async def assemble_video(request: Request):
                 "-c:v", "copy", "-c:a", "aac", "-shortest", "-y", out_16
             ]
 
-        result = subprocess.run(mux_cmd, capture_output=True)
+        result = await loop.run_in_executor(
+            None, lambda cmd=mux_cmd: subprocess.run(cmd, capture_output=True)
+        )
         if result.returncode != 0:
             print(f"[GEN] mux ERROR: {result.stderr.decode()}")
         else:
             print(f"[GEN] mux OK: {os.path.getsize(out_16)} bytes -> {out_16}")
 
-        yield f"data: {json.dumps({'progress': 85})}\n\n"
+        yield f"data: {json.dumps({'progress': 88})}\n\n"
 
         # ── 9:16 crop ─────────────────────────────────────────────────────────
-        result = subprocess.run([
+        crop_cmd = [
             FFMPEG, "-i", out_16,
             "-filter_complex",
             "[0:v]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,boxblur=40:5[bg];"
@@ -394,17 +425,17 @@ async def assemble_video(request: Request):
             "-map", "[out]", "-map", "0:a",
             "-c:v", "libx264", "-preset", "ultrafast",
             "-c:a", "copy", "-y", out_9
-        ], capture_output=True)
+        ]
+        result = await loop.run_in_executor(
+            None, lambda cmd=crop_cmd: subprocess.run(cmd, capture_output=True)
+        )
         if result.returncode != 0:
             print(f"[GEN] crop ERROR: {result.stderr.decode()}")
         else:
             print(f"[GEN] 9:16 OK: {os.path.getsize(out_9)} bytes -> {out_9}")
 
-        yield f"data: {json.dumps({'progress': 95})}\n\n"
-
         print(f"[GEN] DONE. file16={out_16}  file9={out_9}")
         yield f"data: {json.dumps({'progress': 100, 'done': True, 'file16': out_16, 'file9': out_9})}\n\n"
-
     return StreamingResponse(generate(), media_type="text/event-stream")
 
 @app.post("/export")
